@@ -1,13 +1,8 @@
 // netlify/functions/telegram.js
-//
-// Эта функция запускается на сервере Netlify.
-// Токен бота берётся из переменных окружения — в браузере он НИКОГДА не виден.
-//
-// Rate limiting: не более 10 запросов в минуту с одного IP.
 
-const RATE_MAP = {}; // { ip: [timestamps] }
+const RATE_MAP = {};
 const RATE_LIMIT = 10;
-const RATE_WIN   = 60 * 1000; // 1 минута
+const RATE_WIN = 60 * 1000;
 
 function isRateLimited(ip) {
   const now = Date.now();
@@ -18,38 +13,73 @@ function isRateLimited(ip) {
   return false;
 }
 
+function parseMultipart(event) {
+  return new Promise((resolve, reject) => {
+    const Busboy = require('busboy');
+    const bb = Busboy({ headers: event.headers });
+    const fields = {};
+    const files = [];
+
+    bb.on('field', (name, val) => { fields[name] = val; });
+
+    bb.on('file', (name, file, info) => {
+      const chunks = [];
+      file.on('data', d => chunks.push(d));
+      file.on('end', () => {
+        files.push({
+          fieldname: name,
+          content: Buffer.concat(chunks),
+          contentType: info.mimeType,
+          filename: info.filename,
+        });
+      });
+    });
+
+    bb.on('finish', () => resolve({ fields, files }));
+    bb.on('error', reject);
+
+    const body = event.isBase64Encoded
+      ? Buffer.from(event.body, 'base64')
+      : Buffer.from(event.body || '');
+
+    bb.write(body);
+    bb.end();
+  });
+}
+
 exports.handler = async (event) => {
-  // Разрешаем только POST
-  if (event.method !== 'POST') {
+  // Netlify использует event.httpMethod, не event.method
+  if (event.httpMethod !== 'POST') {
     return { statusCode: 405, body: 'Method Not Allowed' };
   }
 
-  // Берём IP из заголовков Netlify
   const ip =
     event.headers['x-nf-client-connection-ip'] ||
     event.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
     'unknown';
 
-  // Проверяем rate limit по IP на уровне сервера
   if (isRateLimited(ip)) {
     return { statusCode: 429, body: JSON.stringify({ error: 'Too Many Requests' }) };
   }
 
-  // Читаем токен и chat_id из переменных окружения Netlify
   const TGT = process.env.TG_TOKEN;
   const TGC = process.env.TG_CHAT_ID;
 
   if (!TGT || !TGC) {
+    console.error('TG_TOKEN или TG_CHAT_ID не заданы в переменных окружения');
     return { statusCode: 500, body: JSON.stringify({ error: 'Bot not configured' }) };
   }
 
   const contentType = event.headers['content-type'] || '';
 
   try {
-    // ── Текстовое сообщение ──
+    // Текстовое сообщение
     if (contentType.includes('application/json')) {
-      const { text } = JSON.parse(event.body);
+      const body = JSON.parse(event.body);
+      const text = body.text;
       if (!text) return { statusCode: 400, body: 'Missing text' };
+
+      console.log('Отправка сообщения в Telegram:', text.substring(0, 80));
 
       const res = await fetch(`https://api.telegram.org/bot${TGT}/sendMessage`, {
         method: 'POST',
@@ -58,20 +88,19 @@ exports.handler = async (event) => {
       });
 
       const data = await res.json();
+      console.log('Ответ Telegram:', JSON.stringify(data));
       return { statusCode: 200, body: JSON.stringify(data) };
     }
 
-    // ── Фото (скриншот оплаты) ──
+    // Фото (скриншот оплаты)
     if (contentType.includes('multipart/form-data')) {
-      // Netlify передаёт multipart как base64 в event.body
-      // Используем node-fetch + FormData через буфер
-      const { parse } = await import('lambda-multipart-parser');
-      const result = await parse(event);
-
-      const photoFile = result.files?.find(f => f.fieldname === 'photo');
-      const caption   = result.caption || '';
+      const { fields, files } = await parseMultipart(event);
+      const photoFile = files.find(f => f.fieldname === 'photo');
+      const caption = fields.caption || '';
 
       if (!photoFile) return { statusCode: 400, body: 'Missing photo' };
+
+      console.log('Отправка фото в Telegram, размер:', photoFile.content.length);
 
       const fd = new FormData();
       fd.append('chat_id', TGC);
@@ -84,6 +113,7 @@ exports.handler = async (event) => {
       });
 
       const data = await res.json();
+      console.log('Ответ Telegram (фото):', JSON.stringify(data));
       return { statusCode: 200, body: JSON.stringify(data) };
     }
 
@@ -91,6 +121,6 @@ exports.handler = async (event) => {
 
   } catch (err) {
     console.error('Telegram function error:', err);
-    return { statusCode: 500, body: JSON.stringify({ error: 'Internal error' }) };
+    return { statusCode: 500, body: JSON.stringify({ error: String(err) }) };
   }
 };
